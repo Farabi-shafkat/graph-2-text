@@ -1,214 +1,265 @@
+"""
+This file handles the details of the loss function during training.
+
+This includes: LossComputeBase and the standard NMTLossCompute, and
+               sharded loss compute stuff.
+"""
+from __future__ import division
 import torch
 import torch.nn as nn
+from torch.autograd import Variable
 
-from onmt.Utils import aeq, sequence_mask
+import onmt
+import onmt.io
 
 
-class GlobalAttention(nn.Module):
+class LossComputeBase(nn.Module):
     """
-    Global attention takes a matrix and a query vector. It
-    then computes a parameterized convex combination of the matrix
-    based on the input query.
-
-    Constructs a unit mapping a query `q` of size `dim`
-    and a source matrix `H` of size `n x dim`, to an output
-    of size `dim`.
+    Class for managing efficient loss computation. Handles
+    sharding next step predictions and accumulating mutiple
+    loss computations
 
 
-    .. mermaid::
-
-       graph BT
-          A[Query]
-          subgraph RNN
-            C[H 1]
-            D[H 2]
-            E[H N]
-          end
-          F[Attn]
-          G[Output]
-          A --> F
-          C --> F
-          D --> F
-          E --> F
-          C -.-> G
-          D -.-> G
-          E -.-> G
-          F --> G
-
-    All models compute the output as
-    :math:`c = \sum_{j=1}^{SeqLength} a_j H_j` where
-    :math:`a_j` is the softmax of a score function.
-    Then then apply a projection layer to [q, c].
-
-    However they
-    differ on how they compute the attention score.
-
-    * Luong Attention (dot, general):
-       * dot: :math:`score(H_j,q) = H_j^T q`
-       * general: :math:`score(H_j, q) = H_j^T W_a q`
-
-
-    * Bahdanau Attention (mlp):
-       * :math:`score(H_j, q) = v_a^T tanh(W_a q + U_a h_j)`
-
+    Users can implement their own loss computation strategy by making
+    subclass of this one.  Users need to implement the _compute_loss()
+    and make_shard_state() methods.
 
     Args:
-       dim (int): dimensionality of query and key
-       coverage (bool): use coverage term
-       attn_type (str): type of attention to use, options [dot,general,mlp]
-
+        generator (:obj:`nn.Module`) :
+             module that maps the output of the decoder to a
+             distribution over the target vocabulary.
+        tgt_vocab (:obj:`Vocab`) :
+             torchtext vocab object representing the target output
+        normalzation (str): normalize by "sents" or "tokens"
     """
-    def __init__(self, dim, coverage=False, attn_type="dot"):
-        super(GlobalAttention, self).__init__()
+    def __init__(self, generator, tgt_vocab):
+        super(LossComputeBase, self).__init__()
+        self.generator = generator
+        self.tgt_vocab = tgt_vocab
+        self.padding_idx = tgt_vocab.stoi[onmt.io.PAD_WORD]
 
-        self.dim = dim
-        self.attn_type = attn_type
-        assert (self.attn_type in ["dot", "general", "mlp"]), (
-                "Please select a valid attention type.")
-
-        if self.attn_type == "general":
-            self.linear_in = nn.Linear(dim, dim, bias=False)
-        elif self.attn_type == "mlp":
-            self.linear_context = nn.Linear(dim, dim, bias=False)
-            self.linear_query = nn.Linear(dim, dim, bias=True)
-            self.v = nn.Linear(dim, 1, bias=False)
-        # mlp wants it with bias
-        out_bias = self.attn_type == "mlp"
-        self.linear_out = nn.Linear(dim*2, dim, bias=out_bias)
-
-        self.sm = nn.Softmax()
-        self.tanh = nn.Tanh()
-
-        if coverage:
-            self.linear_cover = nn.Linear(1, dim, bias=False)
-
-    def score(self, h_t, h_s):
+    def _make_shard_state(self, batch, output, range_, attns=None):
         """
+        Make shard state dictionary for shards() to return iterable
+        shards for efficient loss computation. Subclass must define
+        this method to match its own _compute_loss() interface.
         Args:
-          h_t (`FloatTensor`): sequence of queries `[batch x tgt_len x dim]`
-          h_s (`FloatTensor`): sequence of sources `[batch x src_len x dim]`
-
-        Returns:
-          :obj:`FloatTensor`:
-           raw attention scores (unnormalized) for each src index
-          `[batch x tgt_len x src_len]`
-
+            batch: the current batch.
+            output: the predict output from the model.
+            range_: the range of examples for computing, the whole
+                    batch or a trunc of it?
+            attns: the attns dictionary returned from the model.
         """
+        return NotImplementedError
 
-        # Check input sizes
-        src_batch, src_len, src_dim = h_s.size()
-        tgt_batch, tgt_len, tgt_dim = h_t.size()
-        aeq(src_batch, tgt_batch)
-        aeq(src_dim, tgt_dim)
-        aeq(self.dim, src_dim)
-
-        if self.attn_type in ["general", "dot"]:
-            if self.attn_type == "general":
-                h_t_ = h_t.view(tgt_batch*tgt_len, tgt_dim)
-                h_t_ = self.linear_in(h_t_)
-                h_t = h_t_.view(tgt_batch, tgt_len, tgt_dim)
-            h_s_ = h_s.transpose(1, 2)
-            # (batch, t_len, d) x (batch, d, s_len) --> (batch, t_len, s_len)
-            return torch.bmm(h_t, h_s_)
-        else:
-            dim = self.dim
-            wq = self.linear_query(h_t.view(-1, dim))
-            wq = wq.view(tgt_batch, tgt_len, 1, dim)
-            wq = wq.expand(tgt_batch, tgt_len, src_len, dim)
-
-            uh = self.linear_context(h_s.contiguous().view(-1, dim))
-            uh = uh.view(src_batch, 1, src_len, dim)
-            uh = uh.expand(src_batch, tgt_len, src_len, dim)
-
-            # (batch, t_len, s_len, d)
-            wquh = self.tanh(wq + uh)
-
-            return self.v(wquh.view(-1, dim)).view(tgt_batch, tgt_len, src_len)
-
-    def forward(self, input, memory_bank, memory_lengths=None, coverage=None):
+    def _compute_loss(self, batch, output, target, **kwargs):
         """
+        Compute the loss. Subclass must define this method.
 
         Args:
-          input (`FloatTensor`): query vectors `[batch x tgt_len x dim]`
-          memory_bank (`FloatTensor`): source vectors `[batch x src_len x dim]`
-          memory_lengths (`LongTensor`): the source context lengths `[batch]`
-          coverage (`FloatTensor`): None (not supported yet)
+
+            batch: the current batch.
+            output: the predict output from the model.
+            target: the validate target to compare output with.
+            **kwargs(optional): additional info for computing loss.
+        """
+        return NotImplementedError
+
+    def monolithic_compute_loss(self, batch, output, attns):
+        """
+        Compute the forward loss for the batch.
+
+        Args:
+          batch (batch): batch of labeled examples
+          output (:obj:`FloatTensor`):
+              output of decoder model `[tgt_len x batch x hidden]`
+          attns (dict of :obj:`FloatTensor`) :
+              dictionary of attention distributions
+              `[tgt_len x batch x src_len]`
+        Returns:
+            :obj:`onmt.Statistics`: loss statistics
+        """
+        range_ = (0, batch.tgt.size(0))
+        shard_state = self._make_shard_state(batch, output, range_, attns)
+        _, batch_stats = self._compute_loss(batch, **shard_state)
+
+        return batch_stats
+
+    def sharded_compute_loss(self, batch, output, attns,
+                             cur_trunc, trunc_size, shard_size,
+                             normalization):
+        """Compute the forward loss and backpropagate.  Computation is done
+        with shards and optionally truncation for memory efficiency.
+
+        Also supports truncated BPTT for long sequences by taking a
+        range in the decoder output sequence to back propagate in.
+        Range is from `(cur_trunc, cur_trunc + trunc_size)`.
+
+        Note sharding is an exact efficiency trick to relieve memory
+        required for the generation buffers. Truncation is an
+        approximate efficiency trick to relieve the memory required
+        in the RNN buffers.
+
+        Args:
+          batch (batch) : batch of labeled examples
+          output (:obj:`FloatTensor`) :
+              output of decoder model `[tgt_len x batch x hidden]`
+          attns (dict) : dictionary of attention distributions
+              `[tgt_len x batch x src_len]`
+          cur_trunc (int) : starting position of truncation window
+          trunc_size (int) : length of truncation window
+          shard_size (int) : maximum number of examples in a shard
+          normalization (int) : Loss is divided by this number
 
         Returns:
-          (`FloatTensor`, `FloatTensor`):
+            :obj:`onmt.Statistics`: validation loss statistics
 
-          * Computed vector `[tgt_len x batch x dim]`
-          * Attention distribtutions for each query
-             `[tgt_len x batch x src_len]`
         """
+        batch_stats = onmt.Statistics()
+        range_ = (cur_trunc, cur_trunc + trunc_size)
+        shard_state = self._make_shard_state(batch, output, range_, attns)
 
-        # one step input
-        if input.dim() == 2:
-            one_step = True
-            input = input.unsqueeze(1)
+        for shard in shards(shard_state, shard_size):
+            loss, stats = self._compute_loss(batch, **shard)
+            loss.div(normalization).backward(retain_graph=True)
+            batch_stats.update(stats)
+
+        return batch_stats
+
+    def _stats(self, loss, scores, target):
+        """
+        Args:
+            loss (:obj:`FloatTensor`): the loss computed by the loss criterion.
+            scores (:obj:`FloatTensor`): a score for each possible output
+            target (:obj:`FloatTensor`): true targets
+
+        Returns:
+            :obj:`Statistics` : statistics for this batch.
+        """
+        pred = scores.max(1)[1]
+        non_padding = target.ne(self.padding_idx)
+        num_correct = pred.eq(target) \
+                          .masked_select(non_padding) \
+                          .sum()
+        return onmt.Statistics(loss.item(), non_padding.sum(), num_correct)
+
+    def _bottle(self, v):
+        return v.view(-1, v.size(2))
+
+    def _unbottle(self, v, batch_size):
+        return v.view(-1, batch_size, v.size(1))
+
+
+class NMTLossCompute(LossComputeBase):
+    """
+    Standard NMT Loss Computation.
+    """
+    def __init__(self, generator, tgt_vocab, normalization="sents",
+                 label_smoothing=0.0):
+        super(NMTLossCompute, self).__init__(generator, tgt_vocab)
+        assert (label_smoothing >= 0.0 and label_smoothing <= 1.0)
+        if label_smoothing > 0:
+            # When label smoothing is turned on,
+            # KL-divergence between q_{smoothed ground truth prob.}(w)
+            # and p_{prob. computed by model}(w) is minimized.
+            # If label smoothing value is set to zero, the loss
+            # is equivalent to NLLLoss or CrossEntropyLoss.
+            # All non-true labels are uniformly set to low-confidence.
+            self.criterion = nn.KLDivLoss(size_average=False)
+            one_hot = torch.randn(1, len(tgt_vocab))
+            one_hot.fill_(label_smoothing / (len(tgt_vocab) - 2))
+            one_hot[0][self.padding_idx] = 0
+            self.register_buffer('one_hot', one_hot)
         else:
-            one_step = False
+            weight = torch.ones(len(tgt_vocab))
+            weight[self.padding_idx] = 0
+            self.criterion = nn.NLLLoss(weight, size_average=False)
+        self.confidence = 1.0 - label_smoothing
 
-        batch, sourceL, dim = memory_bank.size()
-        batch_, targetL, dim_ = input.size()
-        aeq(batch, batch_)
-        aeq(dim, dim_)
-        aeq(self.dim, dim)
-        if coverage is not None:
-            batch_, sourceL_ = coverage.size()
-            aeq(batch, batch_)
-            aeq(sourceL, sourceL_)
+    def _make_shard_state(self, batch, output, range_, attns=None):
+        return {
+            "output": output,
+            "target": batch.tgt[range_[0] + 1: range_[1]],
+        }
 
-        if coverage is not None:
-            cover = coverage.view(-1).unsqueeze(1)
-            memory_bank += self.linear_cover(cover).view_as(memory_bank)
-            memory_bank = self.tanh(memory_bank)
+    def _compute_loss(self, batch, output, target):
+        scores = self.generator(self._bottle(output))
 
-        # compute attention scores, as in Luong et al.
-        align = self.score(input, memory_bank)
-
-        if memory_lengths is not None:
-            mask = sequence_mask(memory_lengths)
-            mask = mask.unsqueeze(1)  # Make it broadcastable.
-            align.data.masked_fill_(1 - mask, -float('inf'))
-
-        # Softmax to normalize attention weights
-        align_vectors = self.sm(align.view(batch*targetL, sourceL))
-        align_vectors = align_vectors.view(batch, targetL, sourceL)
-
-        # each context vector c_t is the weighted average
-        # over all the source hidden states
-        c = torch.bmm(align_vectors, memory_bank)
-
-        # concatenate
-        concat_c = torch.cat([c, input], 2).view(batch*targetL, dim*2)
-        attn_h = self.linear_out(concat_c).view(batch, targetL, dim)
-        if self.attn_type in ["general", "dot"]:
-            attn_h = self.tanh(attn_h)
-
-        if one_step:
-            attn_h = attn_h.squeeze(1)
-            align_vectors = align_vectors.squeeze(1)
-
-            # Check output sizes
-            batch_, dim_ = attn_h.size()
-            aeq(batch, batch_)
-            aeq(dim, dim_)
-            batch_, sourceL_ = align_vectors.size()
-            aeq(batch, batch_)
-            aeq(sourceL, sourceL_)
+        gtruth = target.view(-1)
+        if self.confidence < 1:
+            tdata = gtruth.data
+            mask = torch.nonzero(tdata.eq(self.padding_idx)).squeeze()
+            log_likelihood = torch.gather(scores.data, 1, tdata.unsqueeze(1))
+            tmp_ = self.one_hot.repeat(gtruth.size(0), 1)
+            tmp_.scatter_(1, tdata.unsqueeze(1), self.confidence)
+            if mask.dim() > 0:
+                log_likelihood.index_fill_(0, mask, 0)
+                tmp_.index_fill_(0, mask, 0)
+            gtruth = Variable(tmp_, requires_grad=False)
+        loss = self.criterion(scores, gtruth)
+        if self.confidence < 1:
+            # Default: report smoothed ppl.
+            # loss_data = -log_likelihood.sum(0)
+            loss_data = loss.data.clone()
         else:
-            attn_h = attn_h.transpose(0, 1).contiguous()
-            align_vectors = align_vectors.transpose(0, 1).contiguous()
+            loss_data = loss.data.clone()
 
-            # Check output sizes
-            targetL_, batch_, dim_ = attn_h.size()
-            aeq(targetL, targetL_)
-            aeq(batch, batch_)
-            aeq(dim, dim_)
-            targetL_, batch_, sourceL_ = align_vectors.size()
-            aeq(targetL, targetL_)
-            aeq(batch, batch_)
-            aeq(sourceL, sourceL_)
+        stats = self._stats(loss_data, scores.data, target.view(-1).data)
 
-        return attn_h, align_vectors
+        return loss, stats
+
+
+def filter_shard_state(state, requires_grad=True, volatile=False):
+    for k, v in state.items():
+        if v is not None:
+            if isinstance(v, Variable) and v.requires_grad:
+                v = Variable(v.data, requires_grad=requires_grad,
+                             volatile=volatile)
+            yield k, v
+
+
+def shards(state, shard_size, eval=False):
+    """
+    Args:
+        state: A dictionary which corresponds to the output of
+               *LossCompute._make_shard_state(). The values for
+               those keys are Tensor-like or None.
+        shard_size: The maximum size of the shards yielded by the model.
+        eval: If True, only yield the state, nothing else.
+              Otherwise, yield shards.
+
+    Yields:
+        Each yielded shard is a dict.
+
+    Side effect:
+        After the last shard, this function does back-propagation.
+    """
+    if eval:
+        yield filter_shard_state(state, False, True)
+    else:
+        # non_none: the subdict of the state dictionary where the values
+        # are not None.
+        non_none = dict(filter_shard_state(state))
+
+        # Now, the iteration:
+        # state is a dictionary of sequences of tensor-like but we
+        # want a sequence of dictionaries of tensors.
+        # First, unzip the dictionary into a sequence of keys and a
+        # sequence of tensor-like sequences.
+        keys, values = zip(*((k, torch.split(v, shard_size))
+                             for k, v in non_none.items()))
+
+        # Now, yield a dictionary for each shard. The keys are always
+        # the same. values is a sequence of length #keys where each
+        # element is a sequence of length #shards. We want to iterate
+        # over the shards, not over the keys: therefore, the values need
+        # to be re-zipped by shard and then each shard can be paired
+        # with the keys.
+        for shard_tensors in zip(*values):
+            yield dict(zip(keys, shard_tensors))
+
+        # Assumed backprop'd
+        variables = ((state[k], v.grad.data) for k, v in non_none.items()
+                     if isinstance(v, Variable) and v.grad is not None)
+        inputs, grads = zip(*variables)
+        torch.autograd.backward(inputs, grads)

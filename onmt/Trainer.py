@@ -42,7 +42,7 @@ class Statistics(object):
         self.n_correct += stat.n_correct
 
     def accuracy(self):
-        return 100 * (self.n_correct / self.n_words)
+        return 100 * torch.true_divide(self.n_correct , self.n_words)
 
     def xent(self):
         return self.loss / self.n_words
